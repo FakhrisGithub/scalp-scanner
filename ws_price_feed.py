@@ -88,8 +88,8 @@ class BybitWsPriceFeed:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("[WS] Error closing connection: %s", e)
 
     def update_symbols(self, symbols: list):
         """Tambah/ganti symbol yang disubscribe. Akan diapply di reconnect berikutnya."""
@@ -147,7 +147,9 @@ class BybitWsPriceFeed:
             # Handle subscription confirmation
             if data.get("op") == "subscribe":
                 if data.get("success"):
-                    logger.debug(f"[WS] Subscribed OK: {data.get('ret_msg','')}")
+                    logger.debug("[WS] Subscribed OK: %s", data.get("ret_msg", ""))
+                else:
+                    logger.error("[WS] Subscription failed: %s", data.get("ret_msg", "unknown"))
                 return
 
             # Handle ticker update
@@ -200,6 +202,7 @@ class BybitWsPriceFeed:
         if not symbols:
             return
         batch_size = 10
+        failed_count = 0
         for i in range(0, len(symbols), batch_size):
             batch = symbols[i:i + batch_size]
             args  = [f"tickers.{s}" for s in batch]
@@ -210,12 +213,16 @@ class BybitWsPriceFeed:
                     self._subscribed.add(s)
                 time.sleep(0.05)  # jangan flood
             except Exception as e:
-                logger.error(f"[WS] Subscribe error: {e}")
+                failed_count += len(batch)
+                logger.error("[WS] Subscribe error for batch starting at %s: %s", batch[0] if batch else '?', e)
+        if failed_count:
+            logger.warning("[WS] Failed to subscribe %d/%d symbols", failed_count, len(symbols))
 
     def _subscribe_new(self, symbols: list):
         """Subscribe symbol baru yang belum ada di koneksi aktif."""
         new_syms = [s for s in symbols if s not in self._subscribed]
         if new_syms and self._ws:
+            logger.info("[WS] Subscribing %d new symbols", len(new_syms))
             self._do_subscribe(self._ws, new_syms)
 
 

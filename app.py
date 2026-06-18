@@ -13,6 +13,9 @@ Perubahan v3:
 from flask import Flask, jsonify, render_template_string, request
 import threading
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -30,6 +33,8 @@ _state = {
     "scan_num"   : 0,
     "price_ts"   : None,
     "ws_count"   : 0,    # jumlah symbol di WS cache
+    "ws_error"   : None, # WS init error message
+    "scan_failures": 0,  # number of symbols that failed in last scan
 }
 
 _lock = threading.Lock()
@@ -45,16 +50,22 @@ def _init_ws():
 
     try:
         info = session.get_instruments_info(category="linear")
+        result = info.get("result")
+        if not result or "list" not in result:
+            raise ValueError("Unexpected API response: missing 'result.list'")
         symbols = [
             x["symbol"]
-            for x in info["result"]["list"]
-            if x["symbol"].endswith("USDT")
+            for x in result["list"]
+            if x.get("symbol", "").endswith("USDT")
         ]
-        print(f"[ws-init] Starting WS feed for {len(symbols)} symbols...")
+        logger.info("[ws-init] Starting WS feed for %d symbols...", len(symbols))
         start_ws_feed(symbols)
     except Exception as e:
-        print(f"[ws-init] Error: {e}")
-        # Fallback: start tanpa pre-defined symbol list, akan subscribe saat scan
+        logger.error(
+            "[ws-init] Failed to fetch symbols: %s. Starting WS without symbol list.", e
+        )
+        with _lock:
+            _state["ws_error"] = f"WS init partial failure: {e}"
         start_ws_feed()
 
 threading.Thread(target=_init_ws, daemon=True, name="ws-init").start()
@@ -70,6 +81,7 @@ def _ws_price_updater():
     Jalankan tiap 500ms (atau lebih sering jika mau).
     """
     from ws_price_feed import get_ws_price, ws_cache_size
+    consecutive_errors = 0
     while True:
         try:
             with _lock:
@@ -89,9 +101,16 @@ def _ws_price_updater():
                 _state["rows"]     = updated
                 _state["price_ts"] = time.strftime("%H:%M:%S")
                 _state["ws_count"] = ws_cache_size()
+            consecutive_errors = 0
 
         except Exception as e:
-            print(f"[ws-updater] error: {e}")
+            consecutive_errors += 1
+            if consecutive_errors <= 3:
+                logger.error("[ws-updater] error: %s", e)
+            elif consecutive_errors == 4:
+                logger.error(
+                    "[ws-updater] recurring error (suppressing further): %s", e
+                )
 
         time.sleep(0.5)   # update setiap 500ms dari WS cache
 
@@ -109,6 +128,7 @@ def _do_scan():
         _state["error"]    = None
         _state["progress"] = (0, 0)
         _state["scan_num"] += 1
+        _state["scan_failures"] = 0
 
     def progress(done, total):
         with _lock:
@@ -121,19 +141,23 @@ def _do_scan():
         filtered = [r for r in rows if r[5] >= 62][:50]
 
         with _lock:
-            _state["rows"]       = filtered
-            _state["market_ctx"] = ctx
-            _state["last_scan"]  = time.strftime("%Y-%m-%d %H:%M:%S")
-            _state["scanning"]   = False
+            total = _state["progress"][1]
+            _state["rows"]          = filtered
+            _state["market_ctx"]    = ctx
+            _state["last_scan"]     = time.strftime("%Y-%m-%d %H:%M:%S")
+            _state["scanning"]      = False
+            _state["scan_failures"] = total - len(rows) if total else 0
 
     except Exception as e:
+        logger.error("[scan] Scan failed: %s", e, exc_info=True)
         with _lock:
             _state["scanning"] = False
             _state["error"]    = str(e)
 
 def trigger_scan():
-    if _state["scanning"]:
-        return False
+    with _lock:
+        if _state["scanning"]:
+            return False
     t = threading.Thread(target=_do_scan, daemon=True)
     t.start()
     return True
@@ -144,7 +168,10 @@ def trigger_scan():
 
 def _auto_loop():
     while True:
-        trigger_scan()
+        try:
+            trigger_scan()
+        except Exception as e:
+            logger.error("[auto-scan] Error triggering scan: %s", e)
         time.sleep(10 * 60)
 
 threading.Thread(target=_auto_loop, daemon=True).start()
@@ -182,6 +209,8 @@ HTML = """<!DOCTYPE html>
   .badge-ctx     { background: #1a1a2e; color: #aaa; border: 1px solid #333; }
   .badge-ws-ok   { background: #001a3a; color: #00aaff; border: 1px solid #00aaff; }
   .badge-ws-wait { background: #2a1a00; color: #ff8800; border: 1px solid #ff8800; }
+  .badge-err    { background: #3a0000; color: #ff4444; border: 1px solid #ff4444; }
+  .badge-warn   { background: #3a2a00; color: #ffaa00; border: 1px solid #ffaa00; }
 
   .btn {
     padding: 5px 14px; border-radius: 6px; border: none; cursor: pointer;
@@ -280,6 +309,7 @@ HTML = """<!DOCTYPE html>
   <button class="btn btn-scan" onclick="triggerScan()">🔄 Scan</button>
   <span id="ts"       class="ts">-</span>
   <span id="price-ts" class="ts" style="color:#00aaff">⚡ -</span>
+  <span id="err-badge" class="badge badge-err" style="display:none"></span>
 </div>
 
 <!-- FILTERS -->
@@ -363,10 +393,34 @@ let sortAsc = false;
 // Track harga sebelumnya untuk flash effect
 const prevPrices = {};
 
+let fetchErrors = 0;
+
 async function fetchStatus() {
   try {
     const r = await fetch('/api/status');
+    if (!r.ok) {
+      throw new Error(`HTTP ${r.status}: ${r.statusText}`);
+    }
     const d = await r.json();
+    fetchErrors = 0;
+
+    // Error badge
+    const errBadge = document.getElementById('err-badge');
+    if (d.error) {
+      errBadge.style.display = 'inline';
+      errBadge.className = 'badge badge-err';
+      errBadge.textContent = '⚠ Scan error: ' + d.error;
+    } else if (d.scan_failures > 0) {
+      errBadge.style.display = 'inline';
+      errBadge.className = 'badge badge-warn';
+      errBadge.textContent = '⚠ ' + d.scan_failures + ' symbols failed';
+    } else if (d.ws_error) {
+      errBadge.style.display = 'inline';
+      errBadge.className = 'badge badge-warn';
+      errBadge.textContent = '⚠ ' + d.ws_error;
+    } else {
+      errBadge.style.display = 'none';
+    }
 
     // Progress bar
     const wrap = document.getElementById('progress-wrap');
@@ -408,11 +462,35 @@ async function fetchStatus() {
       allRows = d.rows;
       applyFilters();
     }
-  } catch(e) { console.log(e); }
+  } catch(e) {
+    fetchErrors++;
+    console.error('[fetchStatus] error:', e);
+    const errBadge = document.getElementById('err-badge');
+    errBadge.style.display = 'inline';
+    errBadge.className = 'badge badge-err';
+    errBadge.textContent = fetchErrors >= 3
+      ? '⚠ Connection lost — retrying...'
+      : '⚠ Fetch error';
+  }
 }
 
 async function triggerScan() {
-  await fetch('/api/scan', { method: 'POST' });
+  try {
+    const r = await fetch('/api/scan', { method: 'POST' });
+    if (!r.ok) {
+      console.error('[triggerScan] HTTP error:', r.status);
+      const errBadge = document.getElementById('err-badge');
+      errBadge.style.display = 'inline';
+      errBadge.className = 'badge badge-err';
+      errBadge.textContent = '⚠ Failed to trigger scan';
+    }
+  } catch(e) {
+    console.error('[triggerScan] error:', e);
+    const errBadge = document.getElementById('err-badge');
+    errBadge.style.display = 'inline';
+    errBadge.className = 'badge badge-err';
+    errBadge.textContent = '⚠ Failed to trigger scan: network error';
+  }
 }
 
 function applyFilters() {
@@ -548,15 +626,17 @@ def index():
 def api_status():
     with _lock:
         return jsonify({
-            "scanning"   : _state["scanning"],
-            "progress"   : list(_state["progress"]),
-            "rows"       : _state["rows"],
-            "last_scan"  : _state["last_scan"],
-            "market_ctx" : _state["market_ctx"],
-            "error"      : _state["error"],
-            "scan_num"   : _state["scan_num"],
-            "price_ts"   : _state["price_ts"],
-            "ws_count"   : _state["ws_count"],
+            "scanning"      : _state["scanning"],
+            "progress"      : list(_state["progress"]),
+            "rows"          : _state["rows"],
+            "last_scan"     : _state["last_scan"],
+            "market_ctx"    : _state["market_ctx"],
+            "error"         : _state["error"],
+            "scan_num"      : _state["scan_num"],
+            "price_ts"      : _state["price_ts"],
+            "ws_count"      : _state["ws_count"],
+            "ws_error"      : _state["ws_error"],
+            "scan_failures" : _state["scan_failures"],
         })
 
 @app.route("/api/scan", methods=["POST"])

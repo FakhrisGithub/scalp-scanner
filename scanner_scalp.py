@@ -10,6 +10,7 @@ import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 
 import time
+import logging
 import urllib.request
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,8 @@ import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
+
+logger = logging.getLogger(__name__)
 
 # ======================================
 # SESSION
@@ -41,10 +44,17 @@ def refresh_price_cache():
     """Fallback REST bulk fetch — dipanggil sekali di awal scan."""
     global _rest_price_cache
     try:
-        resp  = session.get_tickers(category="linear")
+        resp = session.get_tickers(category="linear")
+        result = resp.get("result")
+        if not result or "list" not in result:
+            logger.warning("[price-cache] Unexpected API response structure: missing 'result.list'")
+            return
         cache = {}
-        for t in resp["result"]["list"]:
-            sym = t["symbol"]
+        parse_errors = 0
+        for t in result["list"]:
+            sym = t.get("symbol", "")
+            if not sym:
+                continue
             try:
                 cache[sym] = {
                     "price"      : float(t.get("lastPrice",    0) or 0),
@@ -54,12 +64,15 @@ def refresh_price_cache():
                     "vol24h"     : float(t.get("volume24h",    0) or 0),
                     "turnover24h": float(t.get("turnover24h",  0) or 0),
                 }
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                parse_errors += 1
+                logger.debug("[price-cache] Parse error for %s: %s", sym, e)
+        if parse_errors:
+            logger.warning("[price-cache] %d symbols had parse errors", parse_errors)
         _rest_price_cache = cache
+        logger.info("[price-cache] Cached %d symbols via REST", len(cache))
     except Exception as e:
-        print("REST price cache error:", e)
-        _rest_price_cache = {}
+        logger.error("[price-cache] REST fetch failed: %s", e, exc_info=True)
 
 def get_live_price(symbol: str) -> tuple:
     """
@@ -101,8 +114,14 @@ def _fetch_json(url: str, timeout: int = 8):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
+    except json.JSONDecodeError as e:
+        logger.error("[news] Invalid JSON from %s: %s", url, e)
+        return None
+    except urllib.error.URLError as e:
+        logger.warning("[news] Network error fetching %s: %s", url, e)
+        return None
     except Exception as e:
-        print(f"[news] {url}: {e}")
+        logger.error("[news] Unexpected error fetching %s: %s", url, e)
         return None
 
 def refresh_news_cache():
@@ -141,8 +160,8 @@ def refresh_news_cache():
         try:
             fg_val   = int(fg_data["data"][0]["value"])
             fg_label = fg_data["data"][0]["value_classification"]
-        except Exception:
-            pass
+        except (KeyError, IndexError, ValueError, TypeError) as e:
+            logger.warning("[news] Failed to parse Fear & Greed data: %s (raw: %s)", e, fg_data.get("data"))
 
     _news_cache.update({
         "trending"   : trending,
@@ -151,7 +170,7 @@ def refresh_news_cache():
         "fg_label"   : fg_label,
         "last_fetch" : now,
     })
-    print(f"[news] F&G={fg_val}({fg_label}) | Trending={len(trending)} | Gainers={len(top_gainers)}")
+    logger.info("[news] F&G=%d(%s) | Trending=%d | Gainers=%d", fg_val, fg_label, len(trending), len(top_gainers))
 
 def get_news_boost(symbol: str) -> tuple:
     is_trending = symbol in _news_cache["trending"]
@@ -197,13 +216,21 @@ def fetch_df(symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
         interval=interval,
         limit=limit
     )
+    result = kline.get("result")
+    if not result or "list" not in result:
+        raise ValueError(f"Unexpected kline response for {symbol}/{interval}: missing 'result.list'")
+    rows = result["list"]
+    if not rows:
+        raise ValueError(f"Empty kline data for {symbol}/{interval}")
     df = pd.DataFrame(
-        kline["result"]["list"],
+        rows,
         columns=["time","open","high","low","close","volume","turnover"]
     )
     df = df[::-1].reset_index(drop=True)
     for col in ["open","high","low","close","volume"]:
         df[col] = df[col].astype(float)
+    if len(df) < 2:
+        raise ValueError(f"Insufficient kline data for {symbol}/{interval}: got {len(df)} rows, need >= 2")
     return df
 
 # ======================================
@@ -431,6 +458,14 @@ def analyze_scalp(symbol: str):
         df15m = add_indicators(fetch_df(symbol, "15",  limit=250))
         df30m = add_indicators(fetch_df(symbol, "30",  limit=250))
         df1h  = add_indicators(fetch_df(symbol, "60",  limit=250))
+    except ValueError as e:
+        logger.warning("[scalp] Skipping %s: %s", symbol, e)
+        return None
+    except Exception as e:
+        logger.error("[scalp] Failed to fetch/compute indicators for %s: %s", symbol, e)
+        return None
+
+    try:
 
         sig5m  = scalp_signal_tf(df5m)
         sig15m = scalp_signal_tf(df15m)
@@ -490,7 +525,7 @@ def analyze_scalp(symbol: str):
         )
 
     except Exception as e:
-        print(f"[scalp] ERROR {symbol}: {e}")
+        logger.error("[scalp] Analysis error for %s: %s", symbol, e, exc_info=True)
         return None
 
 # ======================================
@@ -504,13 +539,24 @@ def scan_scalp(progress_callback=None) -> list:
     """
     refresh_news_cache()
 
-    # Ambil daftar symbol
-    info    = session.get_instruments_info(category="linear")
+    # Ambil daftar symbol — propagate if this fails (critical)
+    try:
+        info = session.get_instruments_info(category="linear")
+    except Exception as e:
+        raise RuntimeError(f"Failed to fetch instrument list from Bybit: {e}") from e
+
+    result = info.get("result")
+    if not result or "list" not in result:
+        raise RuntimeError(f"Unexpected instrument info response: missing 'result.list'")
+
     symbols = [
         x["symbol"]
-        for x in info["result"]["list"]
-        if x["symbol"].endswith("USDT")
+        for x in result["list"]
+        if x.get("symbol", "").endswith("USDT")
     ]
+    if not symbols:
+        logger.warning("[scan] No USDT symbols found")
+        return []
 
     # Pastikan WS sudah subscribe semua symbol ini
     update_ws_symbols(symbols)
@@ -518,22 +564,33 @@ def scan_scalp(progress_callback=None) -> list:
     # Fallback: satu kali REST fetch harga untuk symbol yang WS belum punya
     ws_ready = ws_cache_size() > 0
     if not ws_ready:
-        print("[scan] WS cache kosong, fetch REST harga dulu...")
+        logger.info("[scan] WS cache empty, fetching REST prices as fallback...")
         refresh_price_cache()
 
     results = []
+    failed  = 0
     total   = len(symbols)
     done    = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(analyze_scalp, s) for s in symbols]
+        futures = {ex.submit(analyze_scalp, s): s for s in symbols}
         for f in as_completed(futures):
-            row = f.result()
+            sym = futures[f]
+            try:
+                row = f.result()
+            except Exception as e:
+                logger.error("[scan] Unhandled future error for %s: %s", sym, e)
+                row = None
             if row:
                 results.append(row)
+            else:
+                failed += 1
             done += 1
             if progress_callback:
                 progress_callback(done, total)
+
+    if failed:
+        logger.warning("[scan] %d/%d symbols failed analysis", failed, total)
 
     results.sort(key=lambda x: x[5], reverse=True)  # sort by Score
     return results
