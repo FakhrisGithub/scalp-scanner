@@ -6,12 +6,7 @@ News/Catalyst: CoinGecko Trending + Fear & Greed + Top Gainers
 Price real-time: Bybit WebSocket (bukan REST poll)
 """
 
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
 import time
-import urllib.request
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pybit.unified_trading import HTTP
@@ -19,6 +14,14 @@ import pandas as pd
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands, AverageTrueRange
 from ta.trend import MACD
+
+from shared_utils import (
+    fetch_usdt_symbols,
+    extract_price_tuple,
+    format_change_pct,
+    format_turnover,
+    fetch_json,
+)
 
 # ======================================
 # SESSION
@@ -73,14 +76,7 @@ def get_live_price(symbol: str) -> tuple:
 
     # Fallback REST cache
     d = _rest_price_cache.get(symbol, {})
-    return (
-        d.get("price",        0.0),
-        d.get("change24h",    0.0),
-        d.get("high24h",      0.0),
-        d.get("low24h",       0.0),
-        d.get("vol24h",       0.0),
-        d.get("turnover24h",  0.0),
-    )
+    return extract_price_tuple(d)
 
 # ======================================
 # NEWS & CATALYST — CoinGecko (no key)
@@ -96,15 +92,6 @@ _news_cache: dict = {
 
 NEWS_TTL = 300  # 5 menit
 
-def _fetch_json(url: str, timeout: int = 8):
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except Exception as e:
-        print(f"[news] {url}: {e}")
-        return None
-
 def refresh_news_cache():
     global _news_cache
     now = time.time()
@@ -112,7 +99,7 @@ def refresh_news_cache():
         return
 
     # CoinGecko Trending
-    data     = _fetch_json("https://api.coingecko.com/api/v3/search/trending")
+    data     = fetch_json("https://api.coingecko.com/api/v3/search/trending")
     trending = []
     if data and "coins" in data:
         for item in data["coins"]:
@@ -121,7 +108,7 @@ def refresh_news_cache():
                 trending.append(sym + "USDT")
 
     # Top Gainers 24H
-    data2       = _fetch_json(
+    data2       = fetch_json(
         "https://api.coingecko.com/api/v3/coins/markets"
         "?vs_currency=usd&order=price_change_percentage_24h_desc"
         "&per_page=50&page=1&sparkline=false"
@@ -134,7 +121,7 @@ def refresh_news_cache():
                 top_gainers.append(sym + "USDT")
 
     # Fear & Greed
-    fg_data  = _fetch_json("https://api.alternative.me/fng/?limit=1")
+    fg_data  = fetch_json("https://api.alternative.me/fng/?limit=1")
     fg_val   = 50
     fg_label = "Neutral"
     if fg_data and "data" in fg_data and fg_data["data"]:
@@ -448,8 +435,8 @@ def analyze_scalp(symbol: str):
         # Gunakan WS price (real-time) saat dipanggil
         live_price, change24h, high24h, low24h, vol24h, turnover24h = get_live_price(symbol)
 
-        chg_str = f"+{round(change24h,2)}%" if change24h >= 0 else f"{round(change24h,2)}%"
-        vol_m   = round(turnover24h / 1_000_000, 2)
+        chg_str = format_change_pct(change24h)
+        vol_m   = format_turnover(turnover24h)
 
         return (
             symbol,                         # 0  Coin
@@ -478,7 +465,7 @@ def analyze_scalp(symbol: str):
             chg_str,                        # 23 Chg24h%
             round(high24h, 6),              # 24 High24h
             round(low24h,  6),              # 25 Low24h
-            f"{vol_m}M",                    # 26 Vol24h
+            vol_m,                              # 26 Vol24h
             round(sig30m["rel_vol"], 2),    # 27 RVol30M_tbl
             round(sig1h["rel_vol"], 2),     # 28 RVol1H_tbl
             sig5m["cond"],                  # 29 Cond5M
@@ -505,12 +492,7 @@ def scan_scalp(progress_callback=None) -> list:
     refresh_news_cache()
 
     # Ambil daftar symbol
-    info    = session.get_instruments_info(category="linear")
-    symbols = [
-        x["symbol"]
-        for x in info["result"]["list"]
-        if x["symbol"].endswith("USDT")
-    ]
+    symbols = fetch_usdt_symbols(session)
 
     # Pastikan WS sudah subscribe semua symbol ini
     update_ws_symbols(symbols)
