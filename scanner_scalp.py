@@ -6,9 +6,6 @@ News/Catalyst: CoinGecko Trending + Fear & Greed + Top Gainers
 Price real-time: Bybit WebSocket (bukan REST poll)
 """
 
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
 import time
 import urllib.request
 import json
