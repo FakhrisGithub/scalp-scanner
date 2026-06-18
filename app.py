@@ -14,6 +14,8 @@ from flask import Flask, jsonify, render_template_string, request
 import threading
 import time
 
+from shared_utils import fetch_usdt_symbols, format_change_pct, format_turnover
+
 app = Flask(__name__)
 
 # ======================================
@@ -44,12 +46,7 @@ def _init_ws():
     from scanner_scalp import session
 
     try:
-        info = session.get_instruments_info(category="linear")
-        symbols = [
-            x["symbol"]
-            for x in info["result"]["list"]
-            if x["symbol"].endswith("USDT")
-        ]
+        symbols = fetch_usdt_symbols(session)
         print(f"[ws-init] Starting WS feed for {len(symbols)} symbols...")
         start_ws_feed(symbols)
     except Exception as e:
@@ -80,10 +77,10 @@ def _ws_price_updater():
                     if price > 0:
                         r = list(r)
                         r[22] = round(price, 6)
-                        r[23] = f"+{round(change24h,2)}%" if change24h >= 0 else f"{round(change24h,2)}%"
+                        r[23] = format_change_pct(change24h)
                         r[24] = round(high24h, 6)
                         r[25] = round(low24h, 6)
-                        r[26] = f"{round(turnover24h/1_000_000, 2)}M"
+                        r[26] = format_turnover(turnover24h)
                         r = tuple(r)
                     updated.append(r)
                 _state["rows"]     = updated

@@ -14,6 +14,8 @@ import time
 import json
 import logging
 
+from shared_utils import extract_price_tuple
+
 logger = logging.getLogger(__name__)
 
 # ======================================
@@ -27,14 +29,7 @@ def get_ws_price(symbol: str) -> tuple:
     """Return (price, change24h, high24h, low24h, vol24h, turnover24h) dari WS cache."""
     with _ws_lock:
         d = _ws_cache.get(symbol, {})
-    return (
-        d.get("price",        0.0),
-        d.get("change24h",    0.0),
-        d.get("high24h",      0.0),
-        d.get("low24h",       0.0),
-        d.get("vol24h",       0.0),
-        d.get("turnover24h",  0.0),
-    )
+    return extract_price_tuple(d)
 
 def ws_cache_size() -> int:
     with _ws_lock:
