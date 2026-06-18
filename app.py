@@ -10,11 +10,46 @@ Perubahan v3:
 - WS feed dimulai di startup, subscribe ke semua symbol setelah scan
 """
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, abort
 import threading
 import time
+import os
+import secrets
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+# ======================================
+# SECURITY: Rate Limiting
+# ======================================
+
+_scan_rate = {"last": 0.0, "min_interval": 10}  # seconds between scans
+
+# ======================================
+# SECURITY: Optional API Key Auth
+# ======================================
+
+_API_KEY = os.environ.get("SCANNER_API_KEY", "")
+
+def _check_api_key():
+    """If SCANNER_API_KEY is set, require it on API requests."""
+    if not _API_KEY:
+        return
+    key = request.headers.get("X-API-Key", "") or request.args.get("api_key", "")
+    if not secrets.compare_digest(key, _API_KEY):
+        abort(401)
+
+@app.before_request
+def _security_checks():
+    if request.path.startswith("/api/"):
+        _check_api_key()
+
+@app.after_request
+def _set_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
 
 # ======================================
 # STATE
@@ -451,7 +486,14 @@ function sortBy(col) {
 function renderTable(rows) {
   const tbody = document.getElementById('table-body');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="17" class="empty">Tidak ada coin yang memenuhi filter.</td></tr>';
+    const emptyTr = document.createElement('tr');
+    const emptyTd = document.createElement('td');
+    emptyTd.colSpan = 17;
+    emptyTd.className = 'empty';
+    emptyTd.textContent = 'Tidak ada coin yang memenuhi filter.';
+    emptyTr.appendChild(emptyTd);
+    tbody.innerHTML = '';
+    tbody.appendChild(emptyTr);
     return;
   }
 
@@ -501,25 +543,32 @@ function renderTable(rows) {
       tr = document.createElement('tr');
       tr.dataset.sym = sym;
       tr.dataset.idx = i;
-      tr.innerHTML = `
-        <td class="ts">${i+1}</td>
-        <td class="coin">${sym.replace('USDT','')}</td>
-        <td class="${sCls}">${score}</td>
-        <td class="${biasCls}">${bias}</td>
-        <td class="${gCls}">${grade}</td>
-        <td style="color:${String(r[33]).includes('Bull') ? '#00cc66' : '#ff4444'}">${r[33]}</td>
-        <td class="${rvCls}">${rv5}x</td>
-        <td class="${r[10] >= 2 ? 'rvol-spike' : r[10] >= 1.5 ? 'rvol-high' : 'rvol-ok'}">${r[10]}x</td>
-        <td>${r[7]}</td>
-        <td class="${priceCls}">${price}</td>
-        <td class="${chgCls}">${chg}</td>
-        <td class="${dCls}">${dec}</td>
-        <td style="color:#aa7700">${r[11]}</td>
-        <td>${r[15]}</td>
-        <td style="color:#ff4444">${r[17]}</td>
-        <td style="color:#00cc66">${r[18]}</td>
-        <td style="color:#888">${r[20]}</td>
-      `;
+      const cells = [
+        {cls: 'ts',     text: i+1},
+        {cls: 'coin',   text: sym.replace('USDT','')},
+        {cls: sCls,     text: score},
+        {cls: biasCls,  text: bias},
+        {cls: gCls,     text: grade},
+        {style: 'color:' + (String(r[33]).includes('Bull') ? '#00cc66' : '#ff4444'), text: r[33]},
+        {cls: rvCls,    text: rv5 + 'x'},
+        {cls: r[10] >= 2 ? 'rvol-spike' : r[10] >= 1.5 ? 'rvol-high' : 'rvol-ok', text: r[10] + 'x'},
+        {text: r[7]},
+        {cls: priceCls, text: price},
+        {cls: chgCls,   text: chg},
+        {cls: dCls,     text: dec},
+        {style: 'color:#aa7700', text: r[11]},
+        {text: r[15]},
+        {style: 'color:#ff4444', text: r[17]},
+        {style: 'color:#00cc66', text: r[18]},
+        {style: 'color:#888',    text: r[20]},
+      ];
+      cells.forEach(c => {
+        const td = document.createElement('td');
+        td.textContent = c.text;
+        if (c.cls)   td.className = c.cls;
+        if (c.style) td.setAttribute('style', c.style);
+        tr.appendChild(td);
+      });
     }
     fragment.appendChild(tr);
   });
@@ -561,7 +610,14 @@ def api_status():
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
+    now = time.time()
+    elapsed = now - _scan_rate["last"]
+    if elapsed < _scan_rate["min_interval"]:
+        wait = round(_scan_rate["min_interval"] - elapsed)
+        return jsonify({"ok": False, "msg": f"rate limited, retry in {wait}s"}), 429
     ok = trigger_scan()
+    if ok:
+        _scan_rate["last"] = now
     return jsonify({"ok": ok, "msg": "scanning" if ok else "already scanning"})
 
 # ======================================
@@ -569,6 +625,5 @@ def api_scan():
 # ======================================
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
